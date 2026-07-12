@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EmberGen → WebGPU flipbook (sub-UV + motion-vector blend)</title>
+<style>
+  :root { color-scheme: dark; }
+  html,body { margin:0; height:100%; background:#0b0d12; color:#e7ecf3;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  #wrap { display:flex; flex-direction:column; height:100%; }
+  header { padding:10px 16px; border-bottom:1px solid #1c2230; }
+  header h1 { margin:0; font-size:15px; font-weight:600; letter-spacing:.2px; }
+  header p { margin:3px 0 0; color:#8b95a7; font-size:12px; }
+  #stage { position:relative; flex:1; min-height:0; }
+  canvas { width:100%; height:100%; display:block; }
+  #labels { position:absolute; inset:0; pointer-events:none; }
+  #labels span { position:absolute; top:10px; padding:3px 8px; border-radius:6px;
+    background:#0009; font-size:12px; font-weight:600; }
+  #lblL { left:12px; } #lblR { right:12px; }
+  #panel { position:absolute; left:12px; bottom:12px; background:#0e1218e6;
+    border:1px solid #232c3d; border-radius:10px; padding:12px 14px; width:280px; }
+  #panel .row { display:flex; align-items:center; gap:10px; margin:7px 0; }
+  #panel label { flex:1; color:#aeb8c8; }
+  #panel input[type=range]{ flex:1.4; }
+  #panel .val { width:46px; text-align:right; color:#cdd6e4; font-variant-numeric:tabular-nums; }
+  .sw { display:flex; align-items:center; gap:8px; cursor:pointer; }
+  #err { position:absolute; inset:0; display:none; place-items:center; padding:24px;
+    text-align:center; color:#ffb4a2; }
+  #err div { max-width:520px; }
+  code { background:#1a2130; padding:1px 5px; border-radius:4px; color:#c8d2e2; }
+  .note { color:#7f8aa0; font-size:11px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <header>
+    <h1>EmberGen → WebGPU flipbook &nbsp;·&nbsp; sub-UV + motion-vector blend</h1>
+    <p>Left half = naïve sub-UV (frame stepping). Right half = motion-vector–warped interpolation.
+       Both read the <b>same baked atlas</b>, exactly as an EmberGen <code>Render → Flipbook</code> export would be consumed.</p>
+  </header>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="labels"><span id="lblL">naïve stepping</span><span id="lblR">MV-blended</span></div>
+    <div id="panel">
+      <div class="row"><label for="fps">Playback fps</label>
+        <input id="fps" type="range" min="4" max="60" step="1" value="14"><span class="val" id="fpsV">14</span></div>
+      <div class="row"><label for="mv">MV warp strength</label>
+        <input id="mv" type="range" min="0" max="2" step="0.05" value="1"><span class="val" id="mvV">1.00</span></div>
+      <div class="row"><label class="sw"><input id="add" type="checkbox" checked> additive (emissive) blend</label></div>
+      <div class="row"><label class="sw"><input id="showmv" type="checkbox"> show MV atlas (debug)</label></div>
+      <div class="row"><label class="sw"><input id="split" type="checkbox" checked> split-screen compare</label></div>
+      <div class="note">64-frame (8×8) atlas baked once on load into two textures:
+        <code>color</code> + <code>motionVector</code>. Turn fps low to see stepping vs. blend.</div>
+    </div>
+    <div id="err"><div id="errmsg"></div></div>
+  </div>
+</div>
+<script type="module">
+const GRID = 8, FRAMES = GRID*GRID, CELL = 128, ATLAS = GRID*CELL; // 1024²
+const cv = document.getElementById('cv');
+const errBox = document.getElementById('err'), errMsg = document.getElementById('errmsg');
+function fail(html){ errBox.style.display='grid'; errMsg.innerHTML=html; }
+
+if (!navigator.gpu) fail(`This browser has no <b>WebGPU</b>. Open in Chrome/Edge 113+ or Safari 18+ (Technology Preview), served over <code>localhost</code> or https.`);
+
+const state = { fps:14, mv:1, add:1, showmv:0, split:1, frames:0, t0:0 };
+const bind = (id, key, fn=parseFloat, out) => {
+  const el = document.getElementById(id);
+  const set = () => { state[key] = el.type==='checkbox' ? (el.checked?1:0) : fn(el.value);
+    if (out) document.getElementById(out).textContent = el.type==='checkbox'? '' : (+state[key]).toFixed(id==='fps'?0:2); };
+  el.addEventListener('input', set); set();
+};
+
+async function main(){
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return fail(`No WebGPU adapter (GPU) available.`);
+  const device = await adapter.requestDevice();
+  device.lost.then(i => fail(`WebGPU device lost: ${i.message||i.reason}`));
+
+  const ctx = cv.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  const dpr = Math.min(devicePixelRatio||1, 2);
+  function resize(){ cv.width = Math.max(2, cv.clientWidth*dpr|0); cv.height = Math.max(2, cv.clientHeight*dpr|0); }
+  new ResizeObserver(resize).observe(cv); resize();
+  ctx.configure({ device, format, alphaMode:'opaque' });
+
+  // ---- atlas textures (color + motion vector), rendered once ----
+  const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
+  const colorTex = device.createTexture({ size:[ATLAS,ATLAS], format:'rgba8unorm', usage });
+  const mvTex    = device.createTexture({ size:[ATLAS,ATLAS], format:'rgba8unorm', usage });
+
+  // ---- shared WGSL: procedural explosion field + noise ----
+  const COMMON = /*wgsl*/`
+    fn hash(p:vec2f)->f32{ return fract(sin(dot(p,vec2f(127.1,311.7)))*43758.5453); }
+    fn vnoise(p:vec2f)->f32{
+      let i=floor(p); let f=fract(p); let u=f*f*(3.0-2.0*f);
+      let a=hash(i); let b=hash(i+vec2f(1,0)); let c=hash(i+vec2f(0,1)); let d=hash(i+vec2f(1,1));
+      return mix(mix(a,b,u.x),mix(c,d,u.x),u.y);
+    }
+    fn fbm(p0:vec2f)->f32{ var p=p0; var a=0.5; var s=0.0;
+      for(var i=0;i<5;i++){ s+=a*vnoise(p); p=p*2.02+vec2f(17.0,9.0); a*=0.5; } return s; }
+    // returns rgba color; a = density. 'uv' in cell space [0,1], t in [0,1] over life.
+    fn explosion(uv:vec2f, t:f32)->vec4f{
+      let center=vec2f(0.5, 0.6);
+      let rise = t*0.20;                       // smoke drifts up over life
+      var p = uv - center + vec2f(0.0, rise);  // sample below-center as it rises
+      let ease = 1.0-pow(1.0-t,2.0);           // ease-out expansion
+      let radius = mix(0.03, 0.46, ease);
+      // domain-warped turbulence, finer as it grows
+      let warp = fbm(uv*(4.0+8.0*t)+vec2f(t*1.7,-t*2.3));
+      let d = length(p) + (warp-0.5)*0.16*(0.3+t);
+      let body = smoothstep(radius, radius*0.45, d);        // soft ball
+      let heat = smoothstep(radius*0.85, 0.0, d) * (1.0-smoothstep(0.35,0.85,t)); // hot core early
+      // life alpha: fast ignite, slow dissipate
+      let life = smoothstep(0.0,0.06,t) * (1.0-smoothstep(0.55,1.0,t));
+      let dens = clamp(body*life, 0.0, 1.0);
+      // color ramp: white-hot -> yellow -> orange -> red -> smoke grey
+      let hot = pow(clamp(heat,0.0,1.0), 0.7);
+      let flame = mix(vec3f(0.6,0.12,0.03), vec3f(1.6,1.1,0.4), hot);
+      let smoke = mix(vec3f(0.05,0.05,0.06), vec3f(0.18,0.16,0.15), warp);
+      let col = mix(smoke, flame, hot);
+      return vec4f(col, dens);
+    }`;
+
+  // bake pass: fullscreen triangle covers whole atlas; frag maps pixel->cell->frame
+  const bakeMod = device.createShaderModule({ code:/*wgsl*/`
+    ${COMMON}
+    struct VO{ @builtin(position) pos:vec4f, @location(0) uv:vec2f };
+    @vertex fn vs(@builtin(vertex_index) i:u32)->VO{
+      var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));
+      var o:VO; o.pos=vec4f(p[i],0,1); o.uv=(p[i]*0.5+0.5); return o;
+    }
+    const GRID:f32=${GRID}.0; const FR:f32=${FRAMES}.0;
+    struct FO{ @location(0) color:vec4f, @location(1) mv:vec4f };
+    @fragment fn fs(v:VO)->FO{
+      var uv=vec2f(v.uv.x, 1.0-v.uv.y);          // flip Y so frame 0 is top-left
+      let cell=floor(uv*GRID);
+      let frame=cell.y*GRID+cell.x;
+      let lu=fract(uv*GRID);                       // local uv within cell
+      let t=frame/(FR-1.0);
+      let dt=1.0/(FR-1.0);
+      let c0=explosion(lu, t);
+      // motion vector = per-frame UV displacement of the advecting field, 0.5-centered
+      // like EmberGen's MV pass. Convention: RG = (du,dv) in cell-UV, encoded ENC=8x
+      // (decoder divides by the same 8). Dominant motion = outward from center + rise.
+      let dir = normalize(lu-vec2f(0.5,0.6)+vec2f(1e-4));
+      let vel = (dir*0.9 + vec2f(0.0,-1.0)*0.5) * 0.05 * (0.4+t); // ~2-7% UV / frame
+      var o:FO;
+      o.color=vec4f(clamp(c0.rgb,vec3f(0),vec3f(4)), c0.a);
+      o.mv=vec4f(vel*8.0+0.5, 0.0, 1.0);           // ENC=8 → uses more of the 0..1 range
+      return o;
+    }` });
+
+  const bakePipe = device.createRenderPipeline({ layout:'auto',
+    vertex:{ module:bakeMod, entryPoint:'vs' },
+    fragment:{ module:bakeMod, entryPoint:'fs', targets:[{format:'rgba8unorm'},{format:'rgba8unorm'}] },
+    primitive:{ topology:'triangle-list' } });
+
+  { const enc=device.createCommandEncoder();
+    const pass=enc.beginRenderPass({ colorAttachments:[
+      { view:colorTex.createView(), loadOp:'clear', storeOp:'store', clearValue:{r:0,g:0,b:0,a:0} },
+      { view:mvTex.createView(),    loadOp:'clear', storeOp:'store', clearValue:{r:0.5,g:0.5,b:0,a:1} } ]});
+    pass.setPipeline(bakePipe); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]); }
+
+  // ---- display pass: consume the atlas (sub-UV + MV warp) ----
+  const samp = device.createSampler({ magFilter:'linear', minFilter:'linear' });
+  const uni = device.createBuffer({ size:64, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+  const dispMod = device.createShaderModule({ code:/*wgsl*/`
+    struct U{ res:vec2f, frame:f32, frac:f32, mv:f32, add:f32, showmv:f32, split:f32 };
+    @group(0) @binding(0) var<uniform> u:U;
+    @group(0) @binding(1) var samp:sampler;
+    @group(0) @binding(2) var colTex:texture_2d<f32>;
+    @group(0) @binding(3) var mvTex:texture_2d<f32>;
+    struct VO{ @builtin(position) pos:vec4f, @location(0) uv:vec2f };
+    @vertex fn vs(@builtin(vertex_index) i:u32)->VO{
+      var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));
+      var o:VO; o.pos=vec4f(p[i],0,1); o.uv=p[i]*0.5+0.5; return o;
+    }
+    const GRID:f32=${GRID}.0;
+    fn cellUV(local:vec2f, frame:f32)->vec2f{
+      let fr=clamp(frame,0.0,${FRAMES-1}.0);
+      let col=floor(fr%GRID); let row=floor(fr/GRID);
+      let luv=clamp(local,vec2f(0.001),vec2f(0.999));
+      return (vec2f(col,row)+luv)/GRID;
+    }
+    fn sampleFrame(local:vec2f, frame:f32)->vec4f{ return textureSample(colTex,samp,cellUV(local,frame)); }
+    @fragment fn fs(v:VO)->vec4f{
+      // map screen to a centered square billboard
+      let aspect=u.res.x/u.res.y;
+      var uv=v.uv; uv.y=1.0-uv.y;
+      var local=(uv-0.5); local.x*=aspect; local=local/0.9+0.5;
+      let onRight = v.uv.x>0.5;
+      let useMV = (u.split>0.5 && onRight) || (u.split<0.5);
+      if(local.x<0.0||local.x>1.0||local.y<0.0||local.y>1.0){ return vec4f(0.03,0.035,0.05,1); }
+      let f0=floor(u.frame); let frac=u.frac;
+      if(u.showmv>0.5){ let m=textureSample(mvTex,samp,cellUV(local,f0)); return vec4f(m.rg,0.5,1.0); }
+      var col:vec4f;
+      if(useMV){
+        let DEC=1.0/8.0;                                 // matches bake ENC=8
+        let mv0=(textureSample(mvTex,samp,cellUV(local,f0)).rg-0.5)*DEC*u.mv;
+        let mv1=(textureSample(mvTex,samp,cellUV(local,f0+1.0)).rg-0.5)*DEC*u.mv;
+        let a=sampleFrame(local-mv0*frac, f0);          // advect current frame forward
+        let b=sampleFrame(local+mv1*(1.0-frac), f0+1.0); // advect next frame backward
+        col=mix(a,b,frac);
+      } else {
+        col=sampleFrame(local,f0);                       // hard step, no interpolation
+      }
+      // composite over dark scene; additive for emissive look
+      let bg=vec3f(0.03,0.035,0.05);
+      var outc:vec3f;
+      if(u.add>0.5){ outc=bg+col.rgb*col.a; } else { outc=mix(bg,col.rgb,col.a); }
+      // seam line for split
+      if(u.split>0.5 && abs(v.uv.x-0.5)<0.0012){ outc=vec3f(0.25,0.3,0.4); }
+      return vec4f(outc,1.0);
+    }` });
+  const dispPipe = device.createRenderPipeline({ layout:'auto',
+    vertex:{ module:dispMod, entryPoint:'vs' },
+    fragment:{ module:dispMod, entryPoint:'fs', targets:[{format}] },
+    primitive:{ topology:'triangle-list' } });
+  const dispBind = device.createBindGroup({ layout:dispPipe.getBindGroupLayout(0), entries:[
+    { binding:0, resource:{ buffer:uni } }, { binding:1, resource:samp },
+    { binding:2, resource:colorTex.createView() }, { binding:3, resource:mvTex.createView() } ]});
+
+  const ubuf = new Float32Array(16);
+  function frameAt(ms){
+    const dur = FRAMES/state.fps;                 // seconds per loop
+    const tt = (ms/1000)%dur;
+    const g = tt*state.fps;                         // fractional frame
+    return { f:Math.floor(g), frac:g-Math.floor(g) };
+  }
+  function render(ms){
+    state.frames++;
+    const { f, frac } = frameAt(ms);
+    ubuf[0]=cv.width; ubuf[1]=cv.height; ubuf[2]=f; ubuf[3]=frac;
+    ubuf[4]=state.mv; ubuf[5]=state.add; ubuf[6]=state.showmv; ubuf[7]=state.split;
+    device.queue.writeBuffer(uni,0,ubuf);
+    const enc=device.createCommandEncoder();
+    const pass=enc.beginRenderPass({ colorAttachments:[
+      { view:ctx.getCurrentTexture().createView(), loadOp:'clear', storeOp:'store', clearValue:{r:0.03,g:0.035,b:0.05,a:1} } ]});
+    pass.setPipeline(dispPipe); pass.setBindGroup(0,dispBind); pass.draw(3); pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+  // expose for headless verification (per WebGPU verification pattern)
+  window.__demo = { device, state, render, frameAt, FRAMES, GRID,
+    tick:(ms)=>render(ms||performance.now()) };
+
+  document.getElementById('lblL').style.display = state.split? '':'none';
+  const splitEl=document.getElementById('split');
+  splitEl.addEventListener('input',()=>{ document.getElementById('lblL').style.display=splitEl.checked?'':'none';
+    document.getElementById('lblR').textContent=splitEl.checked?'MV-blended':'MV-blended (full)'; });
+
+  let raf;
+  function loop(ms){ render(ms); raf=requestAnimationFrame(loop); }
+  raf=requestAnimationFrame(loop);
+  console.log('[jangafx flipbook demo] baked', FRAMES, 'frames into', ATLAS+'² atlas — rendering.');
+}
+
+bind('fps','fps',parseFloat,'fpsV');
+bind('mv','mv',parseFloat,'mvV');
+bind('add','add'); bind('showmv','showmv'); bind('split','split');
+if (navigator.gpu) main().catch(e=>fail(`Init error: <code>${(e&&e.message)||e}</code>`));
+</script>
+</body>
+</html>

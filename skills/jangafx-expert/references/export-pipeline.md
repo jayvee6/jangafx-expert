@@ -30,7 +30,7 @@ Your `webgpu-vfx` lib + browser tooling. JangaFX has no web export — you consu
 ### 2.1 Flipbook atlases → animated billboards **[established + your-engineering]**
 - Export from EmberGen/LiquiGen **Render node → Flipbook**, `Columns × Rows` = frame grid (power-of-two sheet, e.g. 8×8). Prefer **EXR** if you want HDR emission; **PNG** for LDR + alpha.
 - In WebGPU: upload the sheet as a `texture_2d`, compute the sub-UV from `frame = floor(time*fps)`, `col = frame % cols`, `row = frame / cols`, offset UVs. Bilinear-blend between consecutive frames to avoid stepping.
-- Pair the **Motion Vector pass** as a second sheet → in-shader frame interpolation (warp frame N toward N+1 by the MV) for smooth slow-mo without more frames. **[established technique; you implement the shader]**
+- Pair the **Motion Vector pass** as a second sheet → in-shader frame interpolation (warp frame N toward N+1 by the MV) for smooth slow-mo without more frames. **[established technique; you implement the shader]** Runnable reference implementation of this consume step: `examples/webgpu-flipbook/` in this repo (bakes both atlases, split-screen naïve-stepping vs MV-blend).
 - Additive blend for fire/emissive; premultiplied-alpha translucent for smoke. Watch the "no additive over white background" gotcha from your emoji-slopes work — composite over scene, not over white.
 
 ### 2.2 Volumetric (VDB) in WebGPU ⚠️ **[your-engineering]**
