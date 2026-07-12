@@ -1,0 +1,38 @@
+{
+  "name": "jangafx-expert",
+  "version": "1.0.0",
+  "description": "Expert advisor for the JangaFX real-time simulation suite — EmberGen (gaseous fluids: fire, smoke, explosions), LiquiGen (liquids, whitewater, foam), GeoGen (procedural terrain), and IlluGen (real-time illumination). Covers the shared node-graph workflow, the parameters that actually matter, and the export pipeline (OpenVDB, Alembic, VAT, flipbooks, EXR passes, heightmaps) into Unreal/Niagara, Blender, WebGPU, and ComfyUI/NeuralFX generative pipelines.",
+  "author": {
+    "name": "Joey Villarreal",
+    "url": "https://github.com/jayvee6"
+  },
+  "homepage": "https://github.com/jayvee6/jangafx-expert",
+  "repository": "https://github.com/jayvee6/jangafx-expert",
+  "license": "MIT",
+  "keywords": [
+    "jangafx",
+    "embergen",
+    "liquigen",
+    "geogen",
+    "illugen",
+    "vfx",
+    "fluid-simulation",
+    "smoke",
+    "fire",
+    "explosion",
+    "liquid",
+    "whitewater",
+    "procedural-terrain",
+    "heightmap",
+    "openvdb",
+    "vdb",
+    "alembic",
+    "vat",
+    "flipbook",
+    "niagara",
+    "unreal",
+    "blender",
+    "webgpu",
+    "comfyui"
+  ]
+}
