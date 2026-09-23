@@ -61,6 +61,18 @@ const GRID = 8, FRAMES = GRID*GRID, CELL = 128, ATLAS = GRID*CELL; // 1024²
 const cv = document.getElementById('cv');
 const errBox = document.getElementById('err'), errMsg = document.getElementById('errmsg');
 function fail(html){ errBox.style.display='grid'; errMsg.innerHTML=html; }
+addEventListener('error', e => fail(`JS error: <code>${e.message}</code>`));
+addEventListener('unhandledrejection', e => fail(`Unhandled: <code>${(e.reason&&e.reason.message)||e.reason}</code>`));
+// tiny HUD so a black canvas is never a black box
+const hud = document.createElement('div');
+hud.style.cssText='position:absolute;right:12px;bottom:12px;background:#0e1218cc;border:1px solid #232c3d;border-radius:8px;padding:6px 10px;font:11px ui-monospace,monospace;color:#9fb0c8;pointer-events:none';
+document.getElementById('stage').appendChild(hud);
+async function checkShader(mod, name){
+  if(!mod.getCompilationInfo) return;
+  const info = await mod.getCompilationInfo();
+  const errs = info.messages.filter(m=>m.type==='error');
+  if(errs.length) fail(`WGSL error in <b>${name}</b>: <code>${errs.map(m=>m.message).join(' · ')}</code>`);
+}
 
 if (!navigator.gpu) fail(`This browser has no <b>WebGPU</b>. Open in Chrome/Edge 113+ or Safari 18+ (Technology Preview), served over <code>localhost</code> or https.`);
 
@@ -152,6 +164,7 @@ async function main(){
       return o;
     }` });
 
+  await checkShader(bakeMod,'bake');
   const bakePipe = device.createRenderPipeline({ layout:'auto',
     vertex:{ module:bakeMod, entryPoint:'vs' },
     fragment:{ module:bakeMod, entryPoint:'fs', targets:[{format:'rgba8unorm'},{format:'rgba8unorm'}] },
@@ -185,7 +198,10 @@ async function main(){
       let luv=clamp(local,vec2f(0.001),vec2f(0.999));
       return (vec2f(col,row)+luv)/GRID;
     }
-    fn sampleFrame(local:vec2f, frame:f32)->vec4f{ return textureSample(colTex,samp,cellUV(local,frame)); }
+    // textureSampleLevel (not textureSample): sampling happens inside non-uniform
+    // control flow (the left/right split), which forbids implicit-LOD sampling in
+    // WGSL — WebKit returns black. No mips here, so level 0 is exact.
+    fn sampleFrame(local:vec2f, frame:f32)->vec4f{ return textureSampleLevel(colTex,samp,cellUV(local,frame),0.0); }
     @fragment fn fs(v:VO)->vec4f{
       // map screen to a centered square billboard
       let aspect=u.res.x/u.res.y;
@@ -195,12 +211,12 @@ async function main(){
       let useMV = (u.split>0.5 && onRight) || (u.split<0.5);
       if(local.x<0.0||local.x>1.0||local.y<0.0||local.y>1.0){ return vec4f(0.03,0.035,0.05,1); }
       let f0=floor(u.frame); let frac=u.frac;
-      if(u.showmv>0.5){ let m=textureSample(mvTex,samp,cellUV(local,f0)); return vec4f(m.rg,0.5,1.0); }
+      if(u.showmv>0.5){ let m=textureSampleLevel(mvTex,samp,cellUV(local,f0),0.0); return vec4f(m.rg,0.5,1.0); }
       var col:vec4f;
       if(useMV){
         let DEC=1.0/8.0;                                 // matches bake ENC=8
-        let mv0=(textureSample(mvTex,samp,cellUV(local,f0)).rg-0.5)*DEC*u.mv;
-        let mv1=(textureSample(mvTex,samp,cellUV(local,f0+1.0)).rg-0.5)*DEC*u.mv;
+        let mv0=(textureSampleLevel(mvTex,samp,cellUV(local,f0),0.0).rg-0.5)*DEC*u.mv;
+        let mv1=(textureSampleLevel(mvTex,samp,cellUV(local,f0+1.0),0.0).rg-0.5)*DEC*u.mv;
         let a=sampleFrame(local-mv0*frac, f0);          // advect current frame forward
         let b=sampleFrame(local+mv1*(1.0-frac), f0+1.0); // advect next frame backward
         col=mix(a,b,frac);
@@ -215,6 +231,7 @@ async function main(){
       if(u.split>0.5 && abs(v.uv.x-0.5)<0.0012){ outc=vec3f(0.25,0.3,0.4); }
       return vec4f(outc,1.0);
     }` });
+  await checkShader(dispMod,'display');
   const dispPipe = device.createRenderPipeline({ layout:'auto',
     vertex:{ module:dispMod, entryPoint:'vs' },
     fragment:{ module:dispMod, entryPoint:'fs', targets:[{format}] },
@@ -233,6 +250,7 @@ async function main(){
   function render(ms){
     state.frames++;
     const { f, frac } = frameAt(ms);
+    if((state.frames&31)===1) hud.textContent = `WebGPU ok · atlas ${ATLAS}² · frame ${f}/${FRAMES-1} · draws ${state.frames}`;
     ubuf[0]=cv.width; ubuf[1]=cv.height; ubuf[2]=f; ubuf[3]=frac;
     ubuf[4]=state.mv; ubuf[5]=state.add; ubuf[6]=state.showmv; ubuf[7]=state.split;
     device.queue.writeBuffer(uni,0,ubuf);
